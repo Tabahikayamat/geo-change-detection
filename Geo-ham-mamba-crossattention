@@ -1,5 +1,5 @@
 # ===========================================================================
-# GeoHam-MambaCD v3-fix: Spatial SSM + Cross-Attention + ChangeAggregator
+# GeoHam-MambaCD : Spatial SSM + Cross-Attention + ChangeAggregator
 # ---------------------------------------------------------------------------
 # CHANGES FROM v3 (which regressed to 0.8362):
 #       Row-wise SSM scan → back to spatial mean (correct for 16×16)
