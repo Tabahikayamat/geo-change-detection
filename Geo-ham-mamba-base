@@ -1,0 +1,621 @@
+# ===========================================================================
+# GeoHam — Base Model
+# ---------------------------------------------------------------------------
+# Architecture: EfficientNet-B2 + Störmer-Verlet Hamiltonian + U-Net Decoder
+# No SSM, No CrossAttention, No ChangeAggregator
+#
+# Usage:
+#   train('LEVIR')    # train on LEVIR-CD
+#   train('CDD')      # train on CDD
+#   train('WHU')      # train on WHU-CD
+# ===========================================================================
+
+import os, random, warnings, copy
+import numpy as np
+from PIL import Image
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+try:
+    import timm
+    HAS_TIMM = True
+except ImportError:
+    HAS_TIMM = False
+    print("[WARN] timm not found. Run: pip install timm")
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+warnings.filterwarnings('ignore')
+
+
+# ─── 1. Configuration ──────────────────────────────────────────────────────
+class Config:
+    SEED   = 42
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    USE_TTA = True
+
+    USE_EMA         = True
+    EMA_START_DECAY = 0.99
+    EMA_END_DECAY   = 0.999
+
+    DATASETS = {
+        'LEVIR':     '/kaggle/working/datasets/LEVIR_Clean',
+        'LEVIRPLUS': '/kaggle/working/datasets/LEVIRPLUS_256',
+        'WHU':       '/kaggle/working/datasets/WHU_256',
+        'CDD':       '/kaggle/input/datasets/ai131452151/cdd-cd',
+    }
+
+    PATCH_SIZE      = 256
+    BATCH_SIZE      = 16
+    EVAL_BATCH_SIZE = 4
+    EPOCHS          = 100
+    LR              = 2e-4
+    WEIGHT_DECAY    = 1e-4
+
+    ENERGY_CONSERVATION_WEIGHT = 0.01
+
+    TOPO_WEIGHT = {
+        'LEVIR':     0.30,
+        'LEVIRPLUS': 0.30,
+        'WHU':       0.10,
+        'CDD':       0.20,
+    }
+
+    FOCAL_ALPHA = {
+        'LEVIR':     0.75,
+        'LEVIRPLUS': 0.75,
+        'WHU':       0.80,
+        'CDD':       0.80,
+    }
+
+    NUM_WORKERS = 2
+    PIN_MEMORY  = True
+    RUN_NAME    = 'GeoHam_Base'
+    OUTPUT_DIR  = './geoham_results'
+    MODEL_DIR   = os.path.join(OUTPUT_DIR, 'models')
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+set_seed(Config.SEED)
+
+
+# ─── 2. Dataset ────────────────────────────────────────────────────────────
+class CDDataset(Dataset):
+    MEAN = (0.485, 0.456, 0.406)
+    STD  = (0.229, 0.224, 0.225)
+
+    def __init__(self, path, split='train'):
+        self.dA = os.path.join(path, split, 'A')
+        self.dB = os.path.join(path, split, 'B')
+        if os.path.exists(os.path.join(path, split, 'OUT')):
+            self.dL = os.path.join(path, split, 'OUT')
+        else:
+            self.dL = os.path.join(path, split, 'label')
+        self.ids = sorted([
+            f for f in os.listdir(self.dA)
+            if f.endswith(('.png', '.jpg', '.tif', '.bmp', '.TIF'))
+        ])
+        if split == 'train':
+            print(f"[DATA] {len(self.ids)} patches for training.")
+        mn, sd = self.MEAN, self.STD
+        if split == 'train':
+            self.tf = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.OneOf([
+                    A.ColorJitter(brightness=0.4, contrast=0.4,
+                                  saturation=0.3, hue=0.1, p=1),
+                    A.CLAHE(clip_limit=4.0, p=1),
+                ], p=0.5),
+                A.GaussianBlur(blur_limit=(3, 5), p=0.3),
+                A.GaussNoise(p=0.2),
+                A.RandomScale(scale_limit=0.2, p=0.3),
+                A.PadIfNeeded(256, 256),
+                A.RandomCrop(256, 256),
+                A.Normalize(mean=mn, std=sd),
+                ToTensorV2()
+            ], additional_targets={'image2': 'image'})
+        else:
+            self.tf = A.Compose([
+                A.Resize(256, 256),
+                A.Normalize(mean=mn, std=sd),
+                ToTensorV2()
+            ], additional_targets={'image2': 'image'})
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        f    = self.ids[idx]
+        img1 = np.array(Image.open(os.path.join(self.dA, f)).convert('RGB'))
+        img2 = np.array(Image.open(os.path.join(self.dB, f)).convert('RGB'))
+        mask = (np.array(Image.open(
+            os.path.join(self.dL, f)).convert('L')) > 0).astype(np.float32)
+        out  = self.tf(image=img1, image2=img2, mask=mask)
+        return out['image'], out['image2'], out['mask'].unsqueeze(0).float()
+
+
+def get_dataloaders(dataset_name):
+    root = Config.DATASETS[dataset_name]
+    loaders = {}
+    val_dir = os.path.join(root, 'val')
+
+    if os.path.exists(val_dir):
+        print("[DATA] Found dedicated 'val' directory.")
+        train_ds = CDDataset(root, 'train')
+        val_ds   = CDDataset(root, 'val')
+    else:
+        print("[DATA] No 'val' — splitting 90/10.")
+        full_train = CDDataset(root, 'train')
+        full_val   = CDDataset(root, 'train')
+        full_val.tf = A.Compose([
+            A.Resize(256, 256),
+            A.Normalize(mean=CDDataset.MEAN, std=CDDataset.STD),
+            ToTensorV2()
+        ], additional_targets={'image2': 'image'})
+        n          = len(full_train)
+        train_size = int(0.9 * n)
+        idx = torch.randperm(
+            n, generator=torch.Generator().manual_seed(Config.SEED)).tolist()
+        train_ds = torch.utils.data.Subset(full_train, idx[:train_size])
+        val_ds   = torch.utils.data.Subset(full_val,   idx[train_size:])
+
+    loaders['train'] = DataLoader(
+        train_ds, batch_size=Config.BATCH_SIZE, shuffle=True,
+        num_workers=Config.NUM_WORKERS, pin_memory=Config.PIN_MEMORY,
+        drop_last=True)
+    loaders['val'] = DataLoader(
+        val_ds, batch_size=Config.EVAL_BATCH_SIZE, shuffle=False,
+        num_workers=Config.NUM_WORKERS, pin_memory=Config.PIN_MEMORY)
+    test_dir = os.path.join(root, 'test')
+    if os.path.exists(test_dir):
+        loaders['test'] = DataLoader(
+            CDDataset(root, 'test'), batch_size=Config.EVAL_BATCH_SIZE,
+            shuffle=False, num_workers=Config.NUM_WORKERS,
+            pin_memory=Config.PIN_MEMORY)
+    return loaders
+
+
+# ─── 3. Symplectic Hamiltonian Integrator ──────────────────────────────────
+class SymplecticHamiltonianIntegrator(nn.Module):
+    """
+    Störmer-Verlet leapfrog integrator — genuinely symplectic.
+
+    Treats T1 feature map as initial position q and evolves it toward T2.
+    Divergence |q_final - q2| is the change map.
+    Energy conservation: H(q,p) should be constant across all 4 steps.
+    """
+    def __init__(self, dim, steps=4):
+        super().__init__()
+        self.steps = steps
+        self.dt    = 1.0 / steps
+        groups     = max(1, dim // 16)
+        while dim % groups != 0 and groups > 1:
+            groups -= 1
+
+        self.dH_dq = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
+            nn.GroupNorm(groups, dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 1, bias=False))
+        self.dH_dp = nn.Sequential(
+            nn.Conv2d(dim, dim, 1, bias=False),
+            nn.GroupNorm(groups, dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 1, bias=False))
+        self.momentum_init = nn.Conv2d(dim, dim, 1, bias=False)
+
+    def hamiltonian_energy(self, q, p):
+        T = 0.5 * (p ** 2).mean(dim=[1, 2, 3])
+        V = 0.5 * (self.dH_dq(q) ** 2).mean(dim=[1, 2, 3])
+        return (T + V).mean()
+
+    def forward(self, q1, q2):
+        q, p = q1, self.momentum_init(q1)
+        dt   = self.dt
+        energy_seq = []
+
+        p = p - 0.5 * dt * self.dH_dq(q)          # initial half-kick
+        for step in range(self.steps):
+            q = q + dt * self.dH_dp(p)             # full position step
+            energy_seq.append(self.hamiltonian_energy(q, p))
+            if step < self.steps - 1:
+                p = p - dt * self.dH_dq(q)         # full momentum step
+        p = p - 0.5 * dt * self.dH_dq(q)          # final half-kick
+
+        divergence = torch.abs(q - q2)
+        return divergence, energy_seq
+
+
+# ─── 4. Decoder Block ──────────────────────────────────────────────────────
+class DecoderBlock(nn.Module):
+    def __init__(self, in_c, skip_c, out_c):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_c + skip_c, out_c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_c), nn.SiLU(),
+            nn.Conv2d(out_c, out_c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_c), nn.SiLU())
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:],
+                              mode='bilinear', align_corners=False)
+        return self.fuse(torch.cat([x, skip], dim=1))
+
+
+# ─── 5. GeoHam Base Model ──────────────────────────────────────────────────
+class GeoHamBase(nn.Module):
+    """
+    GeoHam — Encoder + Störmer-Verlet Hamiltonian + U-Net Decoder
+
+    Data flow:
+      T1, T2
+        │
+        ▼  EfficientNet-B2 (pretrained, shared weights)
+      f1[0..3], f2[0..3]
+        │
+        ├── skip1 = |f1[0] - f2[0]|   [B, c1, H/2,  W/2]
+        ├── skip2 = |f1[1] - f2[1]|   [B, c2, H/4,  W/4]
+        ├── skip3 = |f1[2] - f2[2]|   [B, c3, H/8,  W/8]
+        │
+        ▼  SymplecticHamiltonianIntegrator
+           input: f1[3], f2[3]  [B, c4, H/16, W/16]
+      divergence, energy_seq
+        │
+        ▼  U-Net Decoder (3 stages)
+      logits [B, 1, H, W]
+    """
+    def __init__(self):
+        super().__init__()
+        assert HAS_TIMM, "timm required: pip install timm"
+
+        self.encoder = timm.create_model(
+            'efficientnet_b2', pretrained=True,
+            features_only=True, out_indices=(1, 2, 3, 4))
+        with torch.no_grad():
+            feats = self.encoder(torch.zeros(1, 3, 256, 256))
+            ch    = [f.shape[1] for f in feats]
+
+        c1, c2, c3, c4 = ch
+        print(f"[GeoHam-Base] EfficientNet-B2 channels: {ch}")
+
+        self.hamiltonian = SymplecticHamiltonianIntegrator(c4, steps=4)
+
+        self.dec3 = DecoderBlock(c4, c3, 128)
+        self.dec2 = DecoderBlock(128, c2, 64)
+        self.dec1 = DecoderBlock(64,  c1, 32)
+        self.final_up = nn.Sequential(
+            nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2),
+            nn.SiLU(),
+            nn.Conv2d(16, 1, kernel_size=1))
+
+    def forward(self, t1, t2):
+        f1 = self.encoder(t1)
+        f2 = self.encoder(t2)
+
+        # Raw skip connections — absolute feature difference
+        skip1 = torch.abs(f1[0] - f2[0])
+        skip2 = torch.abs(f1[1] - f2[1])
+        skip3 = torch.abs(f1[2] - f2[2])
+
+        # Hamiltonian divergence — bottleneck features fed directly
+        divergence, energy_seq = self.hamiltonian(f1[3], f2[3])
+
+        # U-Net decode
+        d3     = self.dec3(divergence, skip3)
+        d2     = self.dec2(d3, skip2)
+        d1     = self.dec1(d2, skip1)
+        logits = self.final_up(d1)
+
+        if logits.shape[2:] != t1.shape[2:]:
+            logits = F.interpolate(logits, size=t1.shape[2:],
+                                   mode='bilinear', align_corners=False)
+        return logits, energy_seq
+
+
+# ─── 6. Loss Functions ─────────────────────────────────────────────────────
+class TopologicalPersistenceLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        sx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]])
+        self.register_buffer('sobel_x', sx.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sx.T.contiguous().view(1, 1, 3, 3))
+
+    def gradient_field(self, f):
+        gx = F.conv2d(f, self.sobel_x, padding=1)
+        gy = F.conv2d(f, self.sobel_y, padding=1)
+        return torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
+
+    def critical_point_density(self, f):
+        return torch.exp(-self.gradient_field(f) * 5.0)
+
+    def euler_characteristic(self, p):
+        V  = p.mean(dim=[-2, -1])
+        Eh = (p[:, :, :-1, :] * p[:, :, 1:, :]).mean(dim=[-2, -1])
+        Ev = (p[:, :, :, :-1] * p[:, :, :, 1:]).mean(dim=[-2, -1])
+        Fq = (p[:, :, :-1, :-1] * p[:, :, 1:, :-1] *
+              p[:, :, :-1, 1:]  * p[:, :, 1:, 1:]).mean(dim=[-2, -1])
+        return V - Eh - Ev + Fq
+
+    def forward(self, pred_logits, gt_mask):
+        pp  = torch.sigmoid(pred_logits)
+        Lc  = F.mse_loss(self.critical_point_density(pp),
+                         self.critical_point_density(gt_mask))
+        Lb  = F.l1_loss(self.euler_characteristic(pp),
+                        self.euler_characteristic(gt_mask))
+        Lg  = F.l1_loss(self.gradient_field(pp), self.gradient_field(gt_mask))
+        return Lc + 0.5 * Lb + 0.3 * Lg
+
+
+class PhysicsLoss(nn.Module):
+    """
+    L = L_focal_dice
+      + topo_weight  * L_topological_persistence
+      + lambda_energy * L_energy_conservation
+    """
+    def __init__(self):
+        super().__init__()
+        self.topo = TopologicalPersistenceLoss()
+
+    @staticmethod
+    def focal_dice(logits, target, gamma=2.0, alpha=0.75):
+        bce     = F.binary_cross_entropy_with_logits(logits, target,
+                                                      reduction='none')
+        pt      = torch.exp(-bce)
+        alpha_t = target * alpha + (1 - target) * (1 - alpha)
+        focal   = (alpha_t * (1 - pt) ** gamma * bce).mean()
+        p       = torch.sigmoid(logits)
+        inter   = (p * target).sum()
+        union   = p.sum() + target.sum()
+        dice    = 1 - (2 * inter + 1e-6) / (union + 1e-6)
+        return focal + dice
+
+    def forward(self, pred_logits, gt_mask, energy_seq=None,
+                alpha=0.75, topo_weight=0.30):
+        Lfd    = self.focal_dice(pred_logits, gt_mask, alpha=alpha)
+        Ltopo  = self.topo(pred_logits, gt_mask)
+
+        Lenergy = torch.tensor(0.0, device=pred_logits.device)
+        if energy_seq and len(energy_seq) > 1:
+            Lenergy = torch.stack(energy_seq).var()
+
+        total = (Lfd
+                 + topo_weight                        * Ltopo
+                 + Config.ENERGY_CONSERVATION_WEIGHT  * Lenergy)
+        return total, {
+            'fd':     Lfd.item(),
+            'topo':   Ltopo.item(),
+            'energy': Lenergy.item()
+        }
+
+
+# ─── 7. EMA ────────────────────────────────────────────────────────────────
+class ModelDynamicEMA:
+    def __init__(self, model, start_decay=0.99, end_decay=0.999):
+        self.ema         = copy.deepcopy(model).eval()
+        self.start_decay = start_decay
+        self.end_decay   = end_decay
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model, step, total):
+        decay = (self.start_decay +
+                 (self.end_decay - self.start_decay) * step / max(1, total - 1))
+        for ep, mp in zip(self.ema.parameters(), model.parameters()):
+            ep.copy_(ep * decay + mp.data * (1 - decay))
+        for eb, mb in zip(self.ema.buffers(), model.buffers()):
+            eb.copy_(mb)
+
+
+# ─── 8. Evaluation ─────────────────────────────────────────────────────────
+@torch.inference_mode()
+def evaluate(model, loader, device, thresholds=None):
+    if thresholds is None:
+        thresholds = [0.30, 0.35, 0.40, 0.45, 0.50,
+                      0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    if loader is None:
+        return {'f1': 0., 'iou': 0., 'prec': 0.,
+                'rec': 0., 'oa': 0., 'best_t': 0.5}
+
+    eval_net = model.ema if isinstance(model, ModelDynamicEMA) else model
+    eval_net.eval()
+    stats = {t: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0} for t in thresholds}
+
+    for t1, t2, lb in tqdm(loader, desc="  [EVAL]", leave=False):
+        t1, t2    = t1.to(device), t2.to(device)
+        logits, _ = eval_net(t1, t2)
+        probs     = torch.sigmoid(logits)
+
+        if Config.USE_TTA:
+            for fd in [3, 2]:
+                l, _ = eval_net(torch.flip(t1, [fd]), torch.flip(t2, [fd]))
+                probs += torch.flip(torch.sigmoid(l), [fd])
+            probs = probs / 3.0
+
+        pc = probs.cpu()
+        gt = lb.cpu()
+        for t in thresholds:
+            pred = (pc > t).float()
+            stats[t]['tp'] += int(((pred == 1) & (gt == 1)).sum())
+            stats[t]['fp'] += int(((pred == 1) & (gt == 0)).sum())
+            stats[t]['fn'] += int(((pred == 0) & (gt == 1)).sum())
+            stats[t]['tn'] += int(((pred == 0) & (gt == 0)).sum())
+
+    best_f1, best = -1., {}
+    for t in thresholds:
+        tp, fp, fn, tn = (stats[t]['tp'], stats[t]['fp'],
+                          stats[t]['fn'], stats[t]['tn'])
+        pr  = tp / (tp + fp + 1e-9)
+        rc  = tp / (tp + fn + 1e-9)
+        f1  = 2 * pr * rc / (pr + rc + 1e-9)
+        iou = tp / (tp + fp + fn + 1e-9)
+        oa  = (tp + tn) / (tp + fp + fn + tn + 1e-9)
+        if f1 > best_f1:
+            best_f1 = f1
+            best = {'f1': f1, 'iou': iou, 'prec': pr,
+                    'rec': rc, 'oa': oa, 'best_t': t}
+    return best
+
+
+# ─── 9. AMP Helpers ────────────────────────────────────────────────────────
+def _get_amp_ctx(device):
+    try:    return torch.amp.autocast(device_type=str(device).split(':')[0])
+    except: return torch.cuda.amp.autocast()
+
+def _get_scaler():
+    try:    return torch.amp.GradScaler('cuda')
+    except: return torch.cuda.amp.GradScaler()
+
+
+# ─── 10. Training ──────────────────────────────────────────────────────────
+def train(dataset_name='LEVIR'):
+    os.makedirs(Config.MODEL_DIR, exist_ok=True)
+
+    loaders     = get_dataloaders(dataset_name)
+    model       = GeoHamBase().to(Config.DEVICE)
+    ema         = ModelDynamicEMA(model, Config.EMA_START_DECAY,
+                                  Config.EMA_END_DECAY) if Config.USE_EMA else None
+    criterion   = PhysicsLoss().to(Config.DEVICE)
+    save_path   = os.path.join(Config.MODEL_DIR,
+                               f'best_{Config.RUN_NAME}_{dataset_name}.pth')
+    best_f1     = 0.0
+
+    focal_alpha = Config.FOCAL_ALPHA.get(dataset_name, 0.75)
+    topo_weight = Config.TOPO_WEIGHT.get(dataset_name, 0.30)
+
+    optimizer = optim.AdamW(model.parameters(), lr=Config.LR,
+                            weight_decay=Config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=Config.LR,
+        steps_per_epoch=len(loaders['train']),
+        epochs=Config.EPOCHS, pct_start=0.15, div_factor=25)
+    scaler      = _get_scaler()
+    amp_ctx     = _get_amp_ctx(Config.DEVICE)
+    total_steps = Config.EPOCHS * len(loaders['train'])
+    global_step = 0
+
+    print(f"\n{'='*60}")
+    print(f"  {Config.RUN_NAME}  [{dataset_name}]")
+    print(f"  Device      : {Config.DEVICE}")
+    print(f"  Epochs      : {Config.EPOCHS}  LR: {Config.LR}  BS: {Config.BATCH_SIZE}")
+    print(f"  λ_topo      : {topo_weight}")
+    print(f"  α_focal     : {focal_alpha}")
+    print(f"  λ_energy    : {Config.ENERGY_CONSERVATION_WEIGHT}")
+    print(f"  Architecture: Encoder + Hamiltonian + Decoder")
+    print(f"{'='*60}\n")
+
+    for epoch in range(Config.EPOCHS):
+        model.train()
+        ep_loss     = 0.
+        comp_totals = {'fd': 0., 'topo': 0., 'energy': 0.}
+        grad_norms  = []
+
+        loop = tqdm(loaders['train'],
+                    desc=f"Ep {epoch+1:03d}/{Config.EPOCHS}")
+
+        for t1, t2, lb in loop:
+            t1, t2, lb = (t1.to(Config.DEVICE), t2.to(Config.DEVICE),
+                          lb.to(Config.DEVICE))
+            optimizer.zero_grad()
+
+            with amp_ctx:
+                logits, energy_seq = model(t1, t2)
+                loss, comps = criterion(
+                    logits, lb, energy_seq,
+                    alpha=focal_alpha,
+                    topo_weight=topo_weight)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norms.append(gn.item())
+
+            sb = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler.get_scale() >= sb:
+                scheduler.step()
+                if ema: ema.update(model, global_step, total_steps)
+
+            global_step += 1
+            ep_loss     += loss.item()
+            for k in comp_totals:
+                comp_totals[k] += comps[k]
+
+            loop.set_postfix(
+                loss=f"{loss.item():.4f}",
+                fd=f"{comps['fd']:.3f}",
+                topo=f"{comps['topo']:.3f}",
+                energy=f"{comps['energy']:.5f}",
+                gnorm=f"{gn.item():.2f}")
+
+        nb         = len(loaders['train'])
+        eval_model = ema.ema if ema else model
+        m          = evaluate(eval_model, loaders.get('val'), Config.DEVICE)
+
+        print(
+            f"  Ep {epoch+1:03d} | "
+            f"loss={ep_loss/nb:.4f} | "
+            f"fd={comp_totals['fd']/nb:.3f} "
+            f"topo={comp_totals['topo']/nb:.3f} "
+            f"Econs={comp_totals['energy']/nb:.5f} | "
+            f"F1={m['f1']:.4f} (th={m['best_t']:.2f}) | "
+            f"IoU={m['iou']:.4f} | "
+            f"P={m['prec']:.3f} R={m['rec']:.3f} | "
+            f"gnorm={np.nanmean(grad_norms):.3f} | "
+            f"LR={scheduler.get_last_lr()[-1]:.2e}")
+
+        if m['f1'] > best_f1:
+            best_f1 = m['f1']
+            state   = ema.ema.state_dict() if ema else model.state_dict()
+            torch.save(state, save_path)
+            print(f"  [+] New best saved (F1={best_f1:.4f})")
+
+    # ── Final test evaluation ───────────────────────────────────────────────
+    if loaders.get('test') and loaders.get('val'):
+        eval_model = ema.ema if ema else model
+        eval_model.load_state_dict(
+            torch.load(save_path, map_location=Config.DEVICE,
+                       weights_only=False))
+
+        print("\n[STEP 1] Finding optimal threshold on VALIDATION set...")
+        val_metrics = evaluate(eval_model, loaders['val'], Config.DEVICE)
+        frozen_t    = val_metrics['best_t']
+        print(f"  → Frozen threshold: {frozen_t}")
+
+        print("\n[STEP 2] BLIND evaluation on TEST set with frozen threshold...")
+        m = evaluate(eval_model, loaders['test'], Config.DEVICE,
+                     thresholds=[frozen_t])
+
+        print(f"\n{'='*60}")
+        print(f"  FINAL TEST RESULTS: {Config.RUN_NAME}  [{dataset_name}]")
+        print(f"  λ_topo={topo_weight}  α_focal={focal_alpha}")
+        print(f"{'='*60}")
+        for k, v in m.items():
+            print(f"  {k.upper():12s}: {v:.4f}")
+        print(f"{'='*60}\n")
+
+
+if __name__ == '__main__':
+    #train('LEVIR')
+    train('CDD')
+    # train('WHU')
