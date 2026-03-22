@@ -1,0 +1,89 @@
+# creating clean WHU directory for the proper analyse and experimentation in kaggle 
+
+import os
+import shutil
+import numpy as np
+from PIL import Image
+from tqdm.auto import tqdm
+
+def build_whu_cd_from_footprints(raw_dir, clean_dir):
+    print(f"{'='*60}")
+    print(f" Rebuilding WHU-CD Dataset (XOR Footprint Method)")
+    print(f"{'='*60}")
+    
+    # Base directories based on your exact tree
+    dir_2012 = os.path.join(raw_dir, "1. The two-period image data", "2012", "splited_images")
+    dir_2016 = os.path.join(raw_dir, "1. The two-period image data", "2016", "splited_images")
+    
+    for phase in ['train', 'test']:
+        print(f"\n[PROCESSING] Building '{phase}' set...")
+        
+        # Paths to raw images and footprint labels
+        raw_t1_img_dir = os.path.join(dir_2012, phase, 'image')
+        raw_t1_lbl_dir = os.path.join(dir_2012, phase, 'label')
+        
+        raw_t2_img_dir = os.path.join(dir_2016, phase, 'image')
+        raw_t2_lbl_dir = os.path.join(dir_2016, phase, 'label')
+        
+        # Output paths for the Deep Learning Pipeline
+        dest_A = os.path.join(clean_dir, phase, 'A')
+        dest_B = os.path.join(clean_dir, phase, 'B')
+        dest_L = os.path.join(clean_dir, phase, 'label')
+        
+        os.makedirs(dest_A, exist_ok=True)
+        os.makedirs(dest_B, exist_ok=True)
+        os.makedirs(dest_L, exist_ok=True)
+        
+        if not os.path.exists(raw_t1_img_dir):
+            print(f"[ERROR] Path not found: {raw_t1_img_dir}")
+            return
+            
+        # Find all images
+        valid_exts = ('.png', '.jpg', '.tif', '.bmp')
+        files = sorted([f for f in os.listdir(raw_t1_img_dir) if f.endswith(valid_exts)])
+        print(f"  -> Found {len(files)} patches.")
+        
+        for f in tqdm(files, leave=False):
+            p_t1_img = os.path.join(raw_t1_img_dir, f)
+            p_t2_img = os.path.join(raw_t2_img_dir, f)
+            p_t1_lbl = os.path.join(raw_t1_lbl_dir, f)
+            p_t2_lbl = os.path.join(raw_t2_lbl_dir, f)
+            
+            # Ensure all 4 files exist for this patch
+            if os.path.exists(p_t1_img) and os.path.exists(p_t2_img) and os.path.exists(p_t1_lbl) and os.path.exists(p_t2_lbl):
+                
+                # 1. Copy the raw images straight over
+                shutil.copy2(p_t1_img, os.path.join(dest_A, f))
+                shutil.copy2(p_t2_img, os.path.join(dest_B, f))
+                
+                # 2. Load the footprints and binarize them
+                lbl1 = np.array(Image.open(p_t1_lbl).convert('L'))
+                lbl2 = np.array(Image.open(p_t2_lbl).convert('L'))
+                
+                lbl1_bin = (lbl1 > 127).astype(np.uint8)
+                lbl2_bin = (lbl2 > 127).astype(np.uint8)
+                
+                # 3. Calculate True Change (XOR Logic)
+                # If footprint 1 does not equal footprint 2, a building changed.
+                change_mask = (lbl1_bin != lbl2_bin).astype(np.uint8) * 255
+                
+                # 4. Save the generated change mask
+                Image.fromarray(change_mask).save(os.path.join(dest_L, f))
+            else:
+                print(f"[WARN] Missing pair components for {f}. Skipping.")
+
+    print(f"\n{'='*60}")
+    print(f" [SUCCESS] Dataset ready at: {clean_dir}")
+    print(f"{'='*60}")
+
+# ==========================================
+# EXECUTION
+# ==========================================
+# UPDATE THIS PATH to the root folder of the Kaggle dataset
+# (The folder that CONTAINS "Building change detection dataset_add")
+RAW_DATA_DIR = '/kaggle/input/datasets/' 
+
+# The destination for your clean data
+CLEAN_DATA_DIR = '/kaggle/working/datasets/WHU_Clean'
+
+build_whu_cd_from_footprints(raw_dir=RAW_DATA_DIR, clean_dir=CLEAN_DATA_DIR)
