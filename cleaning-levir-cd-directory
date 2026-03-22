@@ -1,0 +1,50 @@
+import os
+import shutil
+from tqdm.auto import tqdm
+
+# ── 1. Set your paths ──
+# This is the path from your Config in Cell 0
+MESSY_LEVIR_DIR = '/kaggle/input/datasets/anuvabmandall/levircd-original/LEVIR-CD256' 
+CLEAN_LEVIR_DIR = '/kaggle/working/datasets/LEVIR_Clean'
+
+def clean_levir():
+    if not os.path.exists(MESSY_LEVIR_DIR):
+        print(f"Could not find {MESSY_LEVIR_DIR}. Please check the path!")
+        return
+
+    # Look for the A, B, and label folders inside the messy directory
+    subdirs = [d for d in os.listdir(MESSY_LEVIR_DIR) if os.path.isdir(os.path.join(MESSY_LEVIR_DIR, d))]
+    
+    dir_A = next((os.path.join(MESSY_LEVIR_DIR, d) for d in subdirs if d.lower() in ['a', 't1']), None)
+    dir_B = next((os.path.join(MESSY_LEVIR_DIR, d) for d in subdirs if d.lower() in ['b', 't2']), None)
+    dir_L = next((os.path.join(MESSY_LEVIR_DIR, d) for d in subdirs if d.lower() in ['label', 'mask', 'masks']), None)
+
+    if not (dir_A and dir_B and dir_L):
+        print(" Could not find A, B, and label folders in the messy LEVIR directory.")
+        return
+
+    # Create the pristine target directories
+    for split in ['train', 'val', 'test']:
+        for sub in ['A', 'B', 'label']:
+            os.makedirs(os.path.join(CLEAN_LEVIR_DIR, split, sub), exist_ok=True)
+
+    files = [f for f in os.listdir(dir_A) if f.lower().endswith(('.png', '.tif', '.jpg'))]
+    print(f" Found {len(files)} total images in A. Sorting by prefix...")
+
+    for f in tqdm(files, desc="Sorting LEVIR-CD"):
+        fname = f.lower()
+        
+        # Determine the split based on the file name prefix
+        if fname.startswith('train'): split = 'train'
+        elif fname.startswith('val'): split = 'val'
+        elif fname.startswith('test'): split = 'test'
+        else: continue # Skip if it doesn't match any known prefix
+
+        # Safety check: Ensure the exact same file exists in B and label
+        if os.path.exists(os.path.join(dir_B, f)) and os.path.exists(os.path.join(dir_L, f)):
+            shutil.copy(os.path.join(dir_A, f), os.path.join(CLEAN_LEVIR_DIR, split, 'A', f))
+            shutil.copy(os.path.join(dir_B, f), os.path.join(CLEAN_LEVIR_DIR, split, 'B', f))
+            shutil.copy(os.path.join(dir_L, f), os.path.join(CLEAN_LEVIR_DIR, split, 'label', f))
+
+clean_levir()
+print(f"\n ALL DONE! LEVIR-CD is now perfectly structured at: {CLEAN_LEVIR_DIR}")
