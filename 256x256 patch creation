@@ -1,0 +1,77 @@
+# creation of file with 256 x 256 patches
+
+import os
+import cv2
+from tqdm.auto import tqdm
+
+def slice_dataset_to_256(src_dir, dest_dir, patch_size=256):
+    """
+    Takes the 512x512 WHU dataset and perfectly slices it into 4x 256x256 patches.
+    """
+    print(f"{'='*60}")
+    print(f" Slicing Dataset to {patch_size}x{patch_size} Quadrants")
+    print(f"{'='*60}")
+
+    for phase in ['train', 'test']:
+        src_phase = os.path.join(src_dir, phase)
+        dest_phase = os.path.join(dest_dir, phase)
+        
+        if not os.path.exists(src_phase):
+            continue
+            
+        print(f"\n[PROCESSING] Slicing '{phase}' set...")
+        
+        # Create destination subfolders
+        for sub in ['A', 'B', 'label']:
+            os.makedirs(os.path.join(dest_phase, sub), exist_ok=True)
+            
+        # Get all images in folder A
+        src_A_dir = os.path.join(src_phase, 'A')
+        files = sorted([f for f in os.listdir(src_A_dir) if f.endswith(('.png', '.tif', '.jpg'))])
+        
+        for f in tqdm(files, leave=False):
+            # Load T1, T2, and Label
+            img_A = cv2.imread(os.path.join(src_phase, 'A', f), cv2.IMREAD_COLOR)
+            img_B = cv2.imread(os.path.join(src_phase, 'B', f), cv2.IMREAD_COLOR)
+            img_L = cv2.imread(os.path.join(src_phase, 'label', f), cv2.IMREAD_GRAYSCALE)
+            
+            h, w = img_A.shape[:2]
+            
+            # Loop through grid and slice
+            patch_idx = 0
+            for y in range(0, h, patch_size):
+                for x in range(0, w, patch_size):
+                    # Ensure we don't go out of bounds
+                    if y + patch_size > h or x + patch_size > w:
+                        continue
+                        
+                    patch_idx += 1
+                    
+                    # Crop the quadrants
+                    crop_A = img_A[y:y+patch_size, x:x+patch_size]
+                    crop_B = img_B[y:y+patch_size, x:x+patch_size]
+                    crop_L = img_L[y:y+patch_size, x:x+patch_size]
+                    
+                    # Create new filename: original_name_1.png, _2.png, etc.
+                    name, ext = os.path.splitext(f)
+                    new_name = f"{name}_{patch_idx}{ext}"
+                    
+                    # Save
+                    cv2.imwrite(os.path.join(dest_phase, 'A', new_name), crop_A)
+                    cv2.imwrite(os.path.join(dest_phase, 'B', new_name), crop_B)
+                    cv2.imwrite(os.path.join(dest_phase, 'label', new_name), crop_L)
+
+    print(f"\n{'='*60}")
+    print(f" [SUCCESS] Sliced dataset saved to: {dest_dir}")
+    print(f"{'='*60}")
+
+# ==========================================
+# EXECUTION
+# ==========================================
+# Source: Your currently clean 512x512 dataset
+SOURCE_DIR = '/kaggle/working/datasets/WHU_Clean'
+
+# Destination: The new strictly 256x256 dataset
+SLICED_DIR = '/kaggle/working/datasets/WHU_256'
+
+slice_dataset_to_256(src_dir=SOURCE_DIR, dest_dir=SLICED_DIR, patch_size=256)
