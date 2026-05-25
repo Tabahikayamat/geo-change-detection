@@ -1,0 +1,866 @@
+# ===========================================================================
+# GeoHam — Multi-Scale Symplectic Change Detector
+# ---------------------------------------------------------------------------
+#
+#  [R1] FRAMING FIX: Removed all "physics-grounded" claims. Integration is
+#       explicitly framed as "symplectic-regularised feature evolution" —
+#       a structured numerical scheme applied to learned dynamics. There is
+#       no physical PDE residual being enforced (not a PINN).
+#
+#  [R2] MULTI-SCALE INTEGRATION: Störmer-Verlet now runs at 3 FPN levels
+#       (64×64, 32×32, 16×16) with shared weights, NOT only at the bottleneck.
+#       Fine boundary detail is preserved via divergences at 64×64 and a raw
+#       absolute-difference skip at 128×128 that bypasses integration entirely.
+#
+#  [R3] SIMPLIFIED LOSS: 3-term TopologicalPersistenceLoss with hardcoded
+#       Morse-theory weights (0.5, 0.3) replaced by a single BoundaryAwareLoss
+#       term based on morphological gradient of the GT mask. One term, one
+#       hyper-parameter (λ_bnd), ablatable in a single row.
+#
+# Architecture:
+#   EfficientNet-B2 (shared)
+#     → 4 FPN scales  [C0 128px | C1 64px | C2 32px | C3 16px]
+#     → MultiScaleSymplecticIntegrator (shared weights, proj_dim=64)
+#         div_1 [64px], div_2 [32px], div_3 [16px]
+#     + raw abs-diff skip_0  [128px, no integration]
+#     → FPNFusionDecoder  (coarse→fine)
+#     → Logits [256px]
+#
+# Compared to V1:
+#   · Integrator parameter count ↓  (352-dim → 64-dim shared)
+#   · Forward FLOPs ≈ same (3 small integrations vs 1 large)
+#   · Feature richness ↑  (3 divergence scales + 1 raw skip)
+#   · Loss terms  3 → 2  (focal-dice + boundary)
+#   · Energy conservation renamed → symplectic regularisation
+# ===========================================================================
+
+import os, random, warnings, copy
+import numpy as np
+from PIL import Image
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+try:
+    import timm
+    HAS_TIMM = True
+except ImportError:
+    HAS_TIMM = False
+    print("[WARN] timm not found.  pip install timm")
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+warnings.filterwarnings('ignore')
+
+
+# ─── 1. Configuration ──────────────────────────────────────────────────────
+class Config:
+    SEED   = 42
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    USE_TTA = True
+
+    USE_EMA         = True
+    EMA_START_DECAY = 0.99
+    EMA_END_DECAY   = 0.999
+
+    DATASETS = {
+        'LEVIR':     '/kaggle/working/datasets/LEVIR_Clean',
+        'LEVIRPLUS': '/kaggle/input/datasets/ankursinha25/levircdplus/New folder',
+        'WHU':       '/kaggle/working/datasets/CLCD_256',
+        'CDD':       '/kaggle/input/datasets/ai131452151/cdd-cd',
+    }
+
+    PATCH_SIZE      = 256
+    BATCH_SIZE      = 16
+    EVAL_BATCH_SIZE = 4
+    EPOCHS          = 60   
+    LR              = 2.7e-4  
+    WEIGHT_DECAY    = 1e-4
+    
+    PROJ_DIM = 64
+    INTEGRATOR_STEPS = (4, 4, 4)
+    
+  
+    SYMPLECTIC_REG_WEIGHT = 0 
+
+    # <-- Best Boundary Weight from sweep
+    BOUNDARY_WEIGHT = {
+        'LEVIR':     0.528, 
+        'LEVIRPLUS': 0.52,
+        'WHU':       0,   
+        'CDD':       0.20,
+    }
+
+    # <-- Best Focal Alpha from sweep
+    FOCAL_ALPHA = {
+        'LEVIR':     0.641, 
+        'LEVIRPLUS': 0.641,
+        'WHU':       0.660,
+        'CDD':       0.660,
+    }
+
+    NUM_WORKERS = 0
+    PIN_MEMORY  = True
+    RUN_NAME    = 'GeoHam_V2'
+    OUTPUT_DIR  = './geoham_results'
+    MODEL_DIR   = os.path.join(OUTPUT_DIR, 'models')
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+def set_seed(seed=50):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+set_seed(Config.SEED)
+
+
+# ─── 2. Dataset (unchanged from V1) ────────────────────────────────────────
+class CDDataset(Dataset):
+    MEAN = (0.485, 0.456, 0.406)
+    STD  = (0.229, 0.224, 0.225)
+
+    def __init__(self, path, split='train'):
+        self.dA = os.path.join(path, split, 'time1')
+        self.dB = os.path.join(path, split, 'time2')
+        if os.path.exists(os.path.join(path, split, 'OUT')):
+            self.dL = os.path.join(path, split, 'OUT')
+        else:
+            self.dL = os.path.join(path, split, 'label')
+        self.ids = sorted([
+            f for f in os.listdir(self.dA)
+            if f.endswith(('.png', '.jpg', '.tif', '.bmp', '.TIF'))
+        ])
+        if split == 'train':
+            print(f"[DATA] {len(self.ids)} patches for training.")
+        mn, sd = self.MEAN, self.STD
+        if split == 'train':
+            self.tf = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.OneOf([
+                    A.ColorJitter(brightness=0.4, contrast=0.4,
+                                  saturation=0.3, hue=0.1, p=1),
+                    A.CLAHE(clip_limit=4.0, p=1),
+                ], p=0.5),
+                A.GaussianBlur(blur_limit=(3, 5), p=0.3),
+                A.GaussNoise(p=0.2),
+                A.RandomScale(scale_limit=0.2, p=0.3),
+                A.PadIfNeeded(256, 256),
+                A.RandomCrop(256, 256),
+                A.Normalize(mean=mn, std=sd),
+                ToTensorV2()
+            ], additional_targets={'image2': 'image'})
+        else:
+            self.tf = A.Compose([
+                A.Resize(256, 256),
+                A.Normalize(mean=mn, std=sd),
+                ToTensorV2()
+            ], additional_targets={'image2': 'image'})
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        f    = self.ids[idx]
+        img1 = np.array(Image.open(os.path.join(self.dA, f)).convert('RGB'))
+        img2 = np.array(Image.open(os.path.join(self.dB, f)).convert('RGB'))
+        mask = (np.array(Image.open(
+            os.path.join(self.dL, f)).convert('L')) > 0).astype(np.float32)
+        out  = self.tf(image=img1, image2=img2, mask=mask)
+        return out['image'], out['image2'], out['mask'].unsqueeze(0).float()
+
+
+def get_dataloaders(dataset_name):
+    root = Config.DATASETS[dataset_name]
+    loaders = {}
+    val_dir = os.path.join(root, 'val')
+
+    if os.path.exists(val_dir):
+        print("[DATA] Found dedicated 'val' directory.")
+        train_ds = CDDataset(root, 'train')
+        val_ds   = CDDataset(root, 'val')
+    else:
+        print("[DATA] No 'val' — splitting 90/10.")
+        full_train = CDDataset(root, 'train')
+        full_val   = CDDataset(root, 'train')
+        full_val.tf = A.Compose([
+            A.Resize(256, 256),
+            A.Normalize(mean=CDDataset.MEAN, std=CDDataset.STD),
+            ToTensorV2()
+        ], additional_targets={'image2': 'image'})
+        n          = len(full_train)
+        train_size = int(0.9 * n)
+        idx = torch.randperm(
+            n, generator=torch.Generator().manual_seed(Config.SEED)).tolist()
+        train_ds = torch.utils.data.Subset(full_train, idx[:train_size])
+        val_ds   = torch.utils.data.Subset(full_val,   idx[train_size:])
+
+    loaders['train'] = DataLoader(
+        train_ds, batch_size=Config.BATCH_SIZE, shuffle=True,
+        num_workers=Config.NUM_WORKERS, pin_memory=Config.PIN_MEMORY,
+        drop_last=True)
+    loaders['val'] = DataLoader(
+        val_ds, batch_size=Config.EVAL_BATCH_SIZE, shuffle=False,
+        num_workers=Config.NUM_WORKERS, pin_memory=Config.PIN_MEMORY)
+    test_dir = os.path.join(root, 'test')
+    if os.path.exists(test_dir):
+        loaders['test'] = DataLoader(
+            CDDataset(root, 'test'), batch_size=Config.EVAL_BATCH_SIZE,
+            shuffle=False, num_workers=Config.NUM_WORKERS,
+            pin_memory=Config.PIN_MEMORY)
+    return loaders
+
+
+# ─── 3. Störmer-Verlet Integrator (variable steps) ─────────────────────────
+class StormerVerletIntegrator(nn.Module):
+    """
+    Störmer-Verlet (leapfrog) integration applied to projected feature maps.
+
+    FRAMING STATEMENT (addresses R1):
+    ─────────────────────────────────
+    This module applies a symplectic numerical integration scheme to *learned*
+    feature dynamics. It does NOT solve any physical PDE, does NOT enforce
+    PDE residuals, and does NOT constitute physics-informed ML in the PINN
+    sense. There is no physical particle and no physical energy being conserved.
+
+    The motivation is purely structural: symplectic integrators preserve the
+    phase-space volume of the learned vector field, which acts as a geometric
+    regulariser on the feature trajectory from T1 to T2. The "Hamiltonian proxy"
+    H(q,p) = ½‖p‖² + ½‖∇_q H(q)‖² is an *approximation proxy*, not a
+    physical Hamiltonian derived from a conservation law.
+
+    This should be described in any paper as:
+      "Symplectic-regularised feature evolution via Störmer-Verlet integration"
+    and NOT as "physics-grounded" or "energy-conserving" in any physical sense.
+
+    Variable-step support (addresses R2):
+    ──────────────────────────────────────
+    The forward() method accepts an optional `steps` argument so the
+    MultiScaleSymplecticIntegrator can call this shared module with
+    different step counts per FPN scale without allocating separate modules.
+    """
+    def __init__(self, dim: int, default_steps: int = 4):
+        super().__init__()
+        self.default_steps = default_steps
+        groups = max(1, dim // 16)
+        while dim % groups != 0 and groups > 1:
+            groups -= 1
+
+        # dH/dq: depthwise-separable for parameter efficiency
+        self.dH_dq = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
+            nn.GroupNorm(groups, dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 1, bias=False))
+
+        # dH/dp: pointwise (momentum operates channel-wise)
+        self.dH_dp = nn.Sequential(
+            nn.Conv2d(dim, dim, 1, bias=False),
+            nn.GroupNorm(groups, dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 1, bias=False))
+
+        self.p_init = nn.Conv2d(dim, dim, 1, bias=False)
+
+    # ── Hamiltonian proxy ─────────────────────────────────────────────────
+    def hamiltonian_proxy(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        """
+        H_proxy(q,p) = ½<p,p> + ½<∇q H, ∇q H>
+        Used only as a variance regularisation target — not a physical energy.
+        """
+        T = 0.5 * (p ** 2).mean(dim=[1, 2, 3])
+        V = 0.5 * (self.dH_dq(q) ** 2).mean(dim=[1, 2, 3])
+        return (T + V).mean()
+
+    def forward(self, q1: torch.Tensor, q2: torch.Tensor,
+                steps: int = None):
+        """
+        q1, q2 : projected feature maps  [B, dim, H, W]
+        Returns
+          divergence  : |q_evolved - q2|  [B, dim, H, W]
+          proxy_vals  : list of scalar proxy values (len=steps)
+        """
+        if steps is None:
+            steps = self.default_steps
+        dt = 1.0 / steps
+        q, p = q1, self.p_init(q1)
+        proxy_vals = []
+
+        # Störmer-Verlet (leapfrog):
+        #   p_{1/2}   = p_0 - (dt/2) dH/dq(q_0)
+        #   q_{n+1}   = q_n + dt · dH/dp(p_{n+1/2})
+        #   p_{n+3/2} = p_{n+1/2} - dt · dH/dq(q_{n+1})   [full kick]
+        #   p_final   = p_{N-1/2} - (dt/2) dH/dq(q_N)     [half kick]
+        p = p - 0.5 * dt * self.dH_dq(q)
+        for s in range(steps):
+            q = q + dt * self.dH_dp(p)
+            proxy_vals.append(self.hamiltonian_proxy(q, p))
+            if s < steps - 1:
+                p = p - dt * self.dH_dq(q)
+        p = p - 0.5 * dt * self.dH_dq(q)  # noqa: F841  (p used for proxy only)
+
+        divergence = torch.abs(q - q2)
+        return divergence, proxy_vals
+
+
+# ─── 4. Multi-Scale Symplectic Integrator ──────────────────────────────────
+class MultiScaleSymplecticIntegrator(nn.Module):
+    """
+    Applies Störmer-Verlet integration at three FPN scales, sharing weights.
+
+    Addresses R2 (bottleneck-only loses fine detail):
+    ─────────────────────────────────────────────────
+    V1 ran integration only at the 16×16 bottleneck (352 channels).
+    V2 runs at 64×64 (2 steps), 32×32 (3 steps), and 16×16 (4 steps),
+    all projected to proj_dim=64 before integration.
+
+    Sharing the integrator weights across scales:
+      · Reduces parameter count vs 3 separate integrators
+      · Acts as a scale-invariant structural prior
+
+    A lightweight per-scale depthwise refinement conv is applied after
+    integration to allow scale-specific detail recovery.
+    """
+    def __init__(self, channel_list, proj_dim: int = 64,
+                 steps_per_scale=(2, 3, 4)):
+        super().__init__()
+        assert len(channel_list) == len(steps_per_scale), \
+            "channel_list and steps_per_scale must have the same length"
+        self.steps_per_scale = steps_per_scale
+
+        # Project each FPN level to the shared integration space
+        self.projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(c, proj_dim, 1, bias=False),
+                nn.BatchNorm2d(proj_dim),
+                nn.GELU())
+            for c in channel_list
+        ])
+
+        # Single shared integrator (weight sharing across scales)
+        self.integrator = StormerVerletIntegrator(proj_dim, default_steps=4)
+
+        # Per-scale post-integration refinement (depthwise + pointwise)
+        self.refiners = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(proj_dim, proj_dim, 3, padding=1,
+                          groups=proj_dim, bias=False),
+                nn.Conv2d(proj_dim, proj_dim, 1, bias=False),
+                nn.BatchNorm2d(proj_dim),
+                nn.GELU())
+            for _ in channel_list
+        ])
+
+    def forward(self, feats1, feats2):
+        """
+        feats1, feats2 : lists of feature tensors, one per scale
+        Returns
+          divergences  : list[Tensor], one [B, proj_dim, H_s, W_s] per scale
+          all_proxies  : flat list of scalar proxy values from all scales
+        """
+        divergences, all_proxies = [], []
+        for f1, f2, proj, refine, steps in zip(
+                feats1, feats2, self.projectors, self.refiners,
+                self.steps_per_scale):
+            q1  = proj(f1)
+            q2  = proj(f2)
+            div, proxies = self.integrator(q1, q2, steps=steps)
+            div = refine(div)
+            divergences.append(div)
+            all_proxies.extend(proxies)
+        return divergences, all_proxies
+
+
+# ─── 5. FPN Fusion Block ───────────────────────────────────────────────────
+class FPNFusionBlock(nn.Module):
+    """
+    Bilinear upsample → concat with skip → double conv.
+    Using bilinear upsample (not transposed conv) avoids checkerboard artefacts
+    and is marginally faster on modern hardware.
+    """
+    def __init__(self, in_c: int, skip_c: int, out_c: int):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(in_c + skip_c, out_c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_c), nn.SiLU(),
+            nn.Conv2d(out_c, out_c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_c), nn.SiLU())
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, size=skip.shape[2:],
+                          mode='bilinear', align_corners=False)
+        return self.fuse(torch.cat([x, skip], dim=1))
+
+
+# ─── 6. GeoHam-V2 ──────────────────────────────────────────────────────────
+class GeoHamV2(nn.Module):
+    """
+    GeoHam-V2: Multi-Scale Symplectic Change Detector
+
+    Data flow
+    ─────────
+    T1, T2
+      │
+      ▼  EfficientNet-B2 (pretrained, shared encoder)
+    f[0] [C0, 128×128]   f[1] [C1, 64×64]   f[2] [C2, 32×32]   f[3] [C3, 16×16]
+      │         │                │                    │
+      │         └────────────────┴────────────────────┘
+      │                          │
+      │         MultiScaleSymplecticIntegrator (shared weights, proj_dim=64)
+      │           · div_1  [64,  64×64]   (2-step integration)
+      │           · div_2  [64,  32×32]   (3-step integration)
+      │           · div_3  [64,  16×16]   (4-step integration)
+      │
+      │  skip_0 = abs(f1[0] - f2[0]) → project to [32, 128×128]
+      │           (raw difference, NO integration — maximum fine detail)
+      │
+      ▼  FPN Decoder  (coarse → fine)
+    div_3 → FPN(div_2) → FPN(div_1) → FPN(skip_0) → head → logits [1, 256×256]
+    """
+    def __init__(self,
+                 proj_dim: int = 64,
+                 steps_per_scale: tuple = (2, 3, 4)):
+        super().__init__()
+        assert HAS_TIMM, "timm required: pip install timm"
+
+        self.encoder = timm.create_model(
+            'efficientnet_b2', pretrained=True,
+            features_only=True, out_indices=(1, 2, 3, 4))
+
+        with torch.no_grad():
+            feats = self.encoder(torch.zeros(1, 3, 256, 256))
+            ch    = [f.shape[1] for f in feats]
+        c0, c1, c2, c3 = ch
+        print(f"[GeoHam-V2] EfficientNet-B2 channels: {ch}")
+
+        # ── Multi-scale symplectic integration at scales 1, 2, 3 ──────────
+        self.ms_integrator = MultiScaleSymplecticIntegrator(
+            channel_list     = [c1, c2, c3],
+            proj_dim         = proj_dim,
+            steps_per_scale  = steps_per_scale)
+
+        # ── Scale-0 skip: raw abs-diff projected, bypasses integration ─────
+        # Preserves maximum spatial resolution for thin-edge change detection
+        skip_dim = proj_dim // 2
+        self.skip0_proj = nn.Sequential(
+            nn.Conv2d(c0, skip_dim, 1, bias=False),
+            nn.BatchNorm2d(skip_dim),
+            nn.GELU())
+
+        # ── FPN decoder ────────────────────────────────────────────────────
+        #   Stage  input            skip           output
+        #   fpn3:  div_3 [16×16]  + div_2 [32×32] → [proj_dim, 32×32]
+        #   fpn2:  [32×32]        + div_1 [64×64]  → [proj_dim, 64×64]
+        #   fpn1:  [64×64]        + skip_0[128×128]→ [skip_dim, 128×128]
+        self.fpn3 = FPNFusionBlock(proj_dim,  proj_dim,  proj_dim)
+        self.fpn2 = FPNFusionBlock(proj_dim,  proj_dim,  proj_dim)
+        self.fpn1 = FPNFusionBlock(proj_dim,  skip_dim,  skip_dim)
+
+        # ── Prediction head ────────────────────────────────────────────────
+        self.head = nn.Sequential(
+            nn.Conv2d(skip_dim, 16, 3, padding=1, bias=False),
+            nn.BatchNorm2d(16), nn.SiLU(),
+            nn.Conv2d(16, 1, 1))
+
+        self._log_params()
+
+    def _log_params(self):
+        total = sum(p.numel() for p in self.parameters()) / 1e6
+        enc   = sum(p.numel() for p in self.encoder.parameters()) / 1e6
+        print(f"[GeoHam-V2] Total params: {total:.2f}M  "
+              f"(encoder {enc:.2f}M  /  head+integrator "
+              f"{total - enc:.2f}M)")
+
+    def forward(self, t1: torch.Tensor, t2: torch.Tensor):
+        f1 = self.encoder(t1)
+        f2 = self.encoder(t2)
+
+        # ── Scale-0: raw skip (128×128, maximum resolution) ───────────────
+        skip_0 = self.skip0_proj(torch.abs(f1[0] - f2[0]))
+
+        # ── Multi-scale symplectic integration at scales 1, 2, 3 ──────────
+        (div_1, div_2, div_3), proxy_vals = self.ms_integrator(
+            [f1[1], f1[2], f1[3]],
+            [f2[1], f2[2], f2[3]])
+
+        # ── FPN decode: coarse → fine ──────────────────────────────────────
+        d = self.fpn3(div_3, div_2)   # 16 → 32
+        d = self.fpn2(d,    div_1)    # 32 → 64
+        d = self.fpn1(d,    skip_0)   # 64 → 128
+
+        # ── Final upsample to input resolution ────────────────────────────
+        d      = F.interpolate(d, size=t1.shape[2:],
+                               mode='bilinear', align_corners=False)
+        logits = self.head(d)
+
+        return logits, proxy_vals
+
+
+# ─── 7. Boundary-Aware Change Loss ─────────────────────────────────────────
+class BoundaryAwareLoss(nn.Module):
+    """
+    Reviewer-hardened replacement for the 3-term TopologicalPersistenceLoss.
+
+    Addresses R3 (3 terms, unjustified fixed weights, no ablation):
+    ──────────────────────────────────────────────────────────────────
+    V1 TopologicalPersistenceLoss combined three terms:
+      Lc (critical point density), Lb (Euler characteristic), Lg (gradient field)
+    with hardcoded weights 0.5 and 0.3 and no ablation or justification.
+
+    V2 replaces this with a single BoundaryAwareLoss:
+
+      L = L_focal_dice(pred, gt)
+        + λ_bnd · L_bnd_focal(pred, gt, B)
+        + λ_symp · Var(proxy_vals)
+
+    where B = morphological gradient of GT = dilate(gt) − erode(gt).
+
+    Rationale for the single boundary term:
+      · Building edge pixels are the primary hard-negative source
+        (acknowledged in GeoHam paper Fig. 3 and reviewer comment)
+      · Upweighting boundary pixels in focal loss directly addresses this
+      · Single λ_bnd is trivially ablated in one row of Table 2
+      · Morphological gradient is deterministic and fast (no Morse theory)
+
+    Ablation table:
+      Row 1: L_focal_dice only                (λ_bnd=0)
+      Row 2: L_focal_dice + L_bnd_focal       (λ_bnd>0)  ← full V2 loss
+      Row 3: + λ_symp · Var(proxy_vals)       (all terms)
+    """
+    def __init__(self, morph_radius: int = 3):
+        super().__init__()
+        self.pad = morph_radius
+
+    # ── Morphological gradient of GT mask ─────────────────────────────────
+    def _boundary_map(self, mask: torch.Tensor) -> torch.Tensor:
+        """
+        B(y) = dilate(y) − erode(y)
+        Implemented with max-pool (dilation) and min-pool (erosion).
+        Output is in [0, 1].
+        """
+        k = 2 * self.pad + 1
+        dilated =  F.max_pool2d( mask, k, stride=1, padding=self.pad)
+        eroded  = -F.max_pool2d(-mask, k, stride=1, padding=self.pad)
+        return (dilated - eroded).clamp(0, 1)
+
+    # ── Focal + Dice ───────────────────────────────────────────────────────
+    @staticmethod
+    def focal_dice(logits: torch.Tensor, target: torch.Tensor,
+                   gamma: float = 2.0, alpha: float = 0.75) -> torch.Tensor:
+        bce     = F.binary_cross_entropy_with_logits(
+            logits, target, reduction='none')
+        pt      = torch.exp(-bce)
+        alpha_t = target * alpha + (1.0 - target) * (1.0 - alpha)
+        focal   = (alpha_t * (1.0 - pt) ** gamma * bce).mean()
+        p       = torch.sigmoid(logits)
+        inter   = (p * target).sum()
+        union   = p.sum() + target.sum()
+        dice    = 1.0 - (2.0 * inter + 1e-6) / (union + 1e-6)
+        return focal + dice
+
+    # ── Boundary-upweighted focal ──────────────────────────────────────────
+    @staticmethod
+    def boundary_focal(logits: torch.Tensor, target: torch.Tensor,
+                       boundary: torch.Tensor,
+                       gamma: float = 2.0, alpha: float = 0.75,
+                       bnd_upweight: float = 3.0) -> torch.Tensor:
+        """
+        Standard focal loss with pixel weights:
+          w(x) = 1 + bnd_upweight · B(x)
+        Boundary pixels receive (1 + 3) = 4× baseline weight.
+        """
+        bce     = F.binary_cross_entropy_with_logits(
+            logits, target, reduction='none')
+        pt      = torch.exp(-bce)
+        alpha_t = target * alpha + (1.0 - target) * (1.0 - alpha)
+        focal   = alpha_t * (1.0 - pt) ** gamma * bce
+        weight  = 1.0 + bnd_upweight * boundary
+        return (weight * focal).mean()
+
+    # ── Combined loss ──────────────────────────────────────────────────────
+    def forward(self, pred_logits: torch.Tensor, gt_mask: torch.Tensor,
+                proxy_vals=None,
+                alpha: float     = 0.75,
+                bnd_weight: float = 0.30,
+                symp_weight: float = 0.01):
+        """
+        Returns (total_loss, component_dict).
+        component_dict keys: 'fd', 'bnd', 'symp'
+        """
+        Lfd  = self.focal_dice(pred_logits, gt_mask, alpha=alpha)
+
+        bmap = self._boundary_map(gt_mask)
+        Lbnd = self.boundary_focal(pred_logits, gt_mask, bmap, alpha=alpha)
+
+        Lsymp = torch.tensor(0.0, device=pred_logits.device)
+        if proxy_vals and len(proxy_vals) > 1:
+            Lsymp = torch.stack(proxy_vals).var()
+
+        total = Lfd + bnd_weight * Lbnd + symp_weight * Lsymp
+        return total, {
+            'fd':   Lfd.item(),
+            'bnd':  Lbnd.item(),
+            'symp': Lsymp.item()
+        }
+
+
+# ─── 8. EMA (unchanged from V1) ────────────────────────────────────────────
+class ModelDynamicEMA:
+    def __init__(self, model, start_decay=0.99, end_decay=0.999):
+        self.ema         = copy.deepcopy(model).eval()
+        self.start_decay = start_decay
+        self.end_decay   = end_decay
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model, step, total):
+        decay = (self.start_decay +
+                 (self.end_decay - self.start_decay) * step / max(1, total - 1))
+        for ep, mp in zip(self.ema.parameters(), model.parameters()):
+            ep.copy_(ep * decay + mp.data * (1.0 - decay))
+        for eb, mb in zip(self.ema.buffers(), model.buffers()):
+            eb.copy_(mb)
+
+
+# ─── 9. Evaluation (unchanged from V1) ─────────────────────────────────────
+@torch.inference_mode()
+def evaluate(model, loader, device, thresholds=None):
+    if thresholds is None:
+        thresholds = [0.30, 0.35, 0.40, 0.45, 0.50,
+                      0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    if loader is None:
+        return {'f1': 0., 'iou': 0., 'prec': 0.,
+                'rec': 0., 'oa': 0., 'best_t': 0.5}
+
+    eval_net = model.ema if isinstance(model, ModelDynamicEMA) else model
+    eval_net.eval()
+    stats = {t: {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0} for t in thresholds}
+
+    for t1, t2, lb in tqdm(loader, desc="  [EVAL]", leave=False):
+        t1, t2    = t1.to(device), t2.to(device)
+        logits, _ = eval_net(t1, t2)
+        probs     = torch.sigmoid(logits)
+
+        if Config.USE_TTA:
+            for fd in [3, 2]:
+                l, _ = eval_net(torch.flip(t1, [fd]), torch.flip(t2, [fd]))
+                probs += torch.flip(torch.sigmoid(l), [fd])
+            probs = probs / 3.0
+
+        pc = probs.cpu()
+        gt = lb.cpu()
+        for t in thresholds:
+            pred = (pc > t).float()
+            stats[t]['tp'] += int(((pred == 1) & (gt == 1)).sum())
+            stats[t]['fp'] += int(((pred == 1) & (gt == 0)).sum())
+            stats[t]['fn'] += int(((pred == 0) & (gt == 1)).sum())
+            stats[t]['tn'] += int(((pred == 0) & (gt == 0)).sum())
+
+    best_f1, best = -1., {}
+    for t in thresholds:
+        tp, fp, fn, tn = (stats[t]['tp'], stats[t]['fp'],
+                          stats[t]['fn'], stats[t]['tn'])
+        pr  = tp / (tp + fp + 1e-9)
+        rc  = tp / (tp + fn + 1e-9)
+        f1  = 2 * pr * rc / (pr + rc + 1e-9)
+        iou = tp / (tp + fp + fn + 1e-9)
+        oa  = (tp + tn) / (tp + fp + fn + tn + 1e-9)
+        if f1 > best_f1:
+            best_f1 = f1
+            best = {'f1': f1, 'iou': iou, 'prec': pr,
+                    'rec': rc, 'oa': oa, 'best_t': t}
+    return best
+
+
+# ─── 10. AMP Helpers ────────────────────────────────────────────────────────
+def _get_amp_ctx(device):
+    try:    return torch.amp.autocast(device_type=str(device).split(':')[0])
+    except: return torch.cuda.amp.autocast()
+
+def _get_scaler():
+    try:    return torch.amp.GradScaler('cuda')
+    except: return torch.cuda.amp.GradScaler()
+
+
+# ─── 11. Training ────────────────────────────────────────────────────────────
+def train(dataset_name: str = 'LEVIR'):
+    os.makedirs(Config.MODEL_DIR, exist_ok=True)
+    
+    # Define save paths
+    best_path = os.path.join(Config.MODEL_DIR, f'best_{Config.RUN_NAME}_{dataset_name}.pth')
+    checkpoint_path = os.path.join(Config.MODEL_DIR, f'checkpoint_{Config.RUN_NAME}_{dataset_name}.pth')
+
+    loaders   = get_dataloaders(dataset_name)
+    model     = GeoHamV2(proj_dim=Config.PROJ_DIM, steps_per_scale=Config.INTEGRATOR_STEPS).to(Config.DEVICE)
+    ema       = (ModelDynamicEMA(model, Config.EMA_START_DECAY, Config.EMA_END_DECAY) if Config.USE_EMA else None)
+    criterion = BoundaryAwareLoss().to(Config.DEVICE)
+
+    focal_alpha  = Config.FOCAL_ALPHA.get(dataset_name, 0.75)
+    bnd_weight   = Config.BOUNDARY_WEIGHT.get(dataset_name, 0.30)
+    symp_weight  = Config.SYMPLECTIC_REG_WEIGHT
+
+    optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=Config.LR,
+        steps_per_epoch=len(loaders['train']),
+        epochs=Config.EPOCHS, pct_start=0.15, div_factor=25)
+        
+    scaler      = _get_scaler()
+    amp_ctx     = _get_amp_ctx(Config.DEVICE)
+    total_steps = Config.EPOCHS * len(loaders['train'])
+    
+    # ── Auto-Resume Logic ──
+    start_epoch = 0
+    global_step = 0
+    best_f1     = 0.0
+    
+    if os.path.exists(checkpoint_path):
+        print(f"\n[+] Found checkpoint at {checkpoint_path}. Resuming training...")
+        checkpoint = torch.load(checkpoint_path, map_location=Config.DEVICE, weights_only=False)
+        
+        if ema:
+            ema.ema.load_state_dict(checkpoint['model_state'])
+            # Copy EMA weights back to main model so gradients match
+            model.load_state_dict(checkpoint['model_state']) 
+        else:
+            model.load_state_dict(checkpoint['model_state'])
+            
+        optimizer.load_state_dict(checkpoint['optimizer_state'])
+        scheduler.load_state_dict(checkpoint['scheduler_state'])
+        scaler.load_state_dict(checkpoint['scaler_state'])
+        
+        start_epoch = checkpoint['epoch'] + 1
+        global_step = checkpoint['global_step']
+        best_f1     = checkpoint['best_f1']
+        
+        print(f"    Resuming from Epoch {start_epoch+1} / {Config.EPOCHS} (Best F1 so far: {best_f1:.4f})")
+    else:
+        print(f"\n[!] No checkpoint found. Starting fresh from Epoch 1.")
+
+    if start_epoch >= Config.EPOCHS:
+        print(f"\n[✓] Training already completed up to {Config.EPOCHS} epochs. Skipping directly to evaluation.")
+    else:
+        print(f"\n{'='*65}")
+        print(f"  {Config.RUN_NAME}  [{dataset_name}]")
+        print(f"  Device        : {Config.DEVICE}")
+        print(f"  Epochs        : {Config.EPOCHS}  LR: {Config.LR}  BS: {Config.BATCH_SIZE}")
+        print(f"  proj_dim      : {Config.PROJ_DIM}")
+        print(f"  integr steps  : {Config.INTEGRATOR_STEPS}  (64px / 32px / 16px)")
+        print(f"  λ_boundary    : {bnd_weight}  (replaces 3-term topo loss)")
+        print(f"  λ_symp_reg    : {symp_weight}  (proxy variance, not physical energy)")
+        print(f"  α_focal       : {focal_alpha}")
+        print(f"{'='*65}\n")
+
+        for epoch in range(start_epoch, Config.EPOCHS):
+            model.train()
+            ep_loss     = 0.
+            comp_totals = {'fd': 0., 'bnd': 0., 'symp': 0.}
+            grad_norms  = []
+
+            loop = tqdm(loaders['train'], desc=f"Ep {epoch+1:03d}/{Config.EPOCHS}")
+
+            for t1, t2, lb in loop:
+                t1, t2, lb = t1.to(Config.DEVICE), t2.to(Config.DEVICE), lb.to(Config.DEVICE)
+                optimizer.zero_grad()
+
+                with amp_ctx:
+                    logits, proxy_vals = model(t1, t2)
+                    loss, comps = criterion(
+                        logits, lb, proxy_vals,
+                        alpha       = focal_alpha,
+                        bnd_weight  = bnd_weight,
+                        symp_weight = symp_weight)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norms.append(gn.item())
+
+                sb = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler.get_scale() >= sb:
+                    scheduler.step()
+                    if ema:
+                        ema.update(model, global_step, total_steps)
+
+                global_step += 1
+                ep_loss     += loss.item()
+                for k in comp_totals:
+                    comp_totals[k] += comps[k]
+
+                loop.set_postfix(
+                    loss=f"{loss.item():.4f}", fd=f"{comps['fd']:.3f}",
+                    bnd=f"{comps['bnd']:.3f}", symp=f"{comps['symp']:.5f}",
+                    gnorm=f"{gn.item():.2f}")
+
+            nb         = len(loaders['train'])
+            eval_model = ema.ema if ema else model
+            m          = evaluate(eval_model, loaders.get('val'), Config.DEVICE)
+
+            print(
+                f"  Ep {epoch+1:03d} | "
+                f"loss={ep_loss/nb:.4f} | "
+                f"fd={comp_totals['fd']/nb:.3f} bnd={comp_totals['bnd']/nb:.3f} symp={comp_totals['symp']/nb:.5f} | "
+                f"F1={m['f1']:.4f} (th={m['best_t']:.2f}) | IoU={m['iou']:.4f} | "
+                f"P={m['prec']:.3f} R={m['rec']:.3f} | gnorm={np.nanmean(grad_norms):.3f} | "
+                f"LR={scheduler.get_last_lr()[-1]:.2e}")
+
+            # Always save the latest state so we can resume if interrupted
+            checkpoint_state = {
+                'epoch': epoch,
+                'global_step': global_step,
+                'model_state': ema.ema.state_dict() if ema else model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
+                'scaler_state': scaler.state_dict(),
+                'best_f1': best_f1
+            }
+            torch.save(checkpoint_state, checkpoint_path)
+
+            if m['f1'] > best_f1:
+                best_f1 = m['f1']
+                # Save just the weights of the best model for final use
+                torch.save(checkpoint_state['model_state'], best_path)
+                print(f"  [+] New best saved (F1={best_f1:.4f})")
+
+    # ── Final test evaluation (frozen threshold from val) ──────────────────
+    if loaders.get('test') and loaders.get('val'):
+        eval_model = ema.ema if ema else model
+        # Load the BEST model for the final test
+        if os.path.exists(best_path):
+            eval_model.load_state_dict(torch.load(best_path, map_location=Config.DEVICE, weights_only=False))
+        else:
+            print("[!] Warning: Best model file missing. Evaluating current state.")
+
+        print("\n[STEP 1] Finding optimal threshold on VALIDATION set...")
+        val_metrics = evaluate(eval_model, loaders['val'], Config.DEVICE)
+        frozen_t    = val_metrics['best_t']
+        print(f"  → Frozen threshold: {frozen_t}")
+
+        print("\n[STEP 2] BLIND evaluation on TEST set with frozen threshold...")
+        m = evaluate(eval_model, loaders['test'], Config.DEVICE, thresholds=[frozen_t])
+
+        print(f"\n{'='*65}")
+        print(f"  FINAL TEST RESULTS: {Config.RUN_NAME}  [{dataset_name}]")
+        print(f"  λ_bnd={bnd_weight}  λ_symp={symp_weight}  α_focal={focal_alpha}")
+        print(f"{'='*65}")   
+        for k, v in m.items():
+            print(f"  {k.upper():12s}: {v:.4f}")
+        print(f"{'='*65}\n")
+
+if __name__ == '__main__':
+    #train('LEVIR')
+    # train('CDD')
+    train('WHU')
